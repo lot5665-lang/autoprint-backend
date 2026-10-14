@@ -252,9 +252,33 @@ def rate_limited(bucket: str, key: str, limit: int, window: float) -> bool:
     return _rate_count(bucket, key, window) >= limit
 
 
+_bad_events = {}  # 접속주소 -> [(시각, 시도한 코드), ...]
+
+
+def _bad_add(ip: str, item: str):
+    with _rate_lock:
+        _bad_events.setdefault(ip, []).append((time.time(), item))
+        if len(_bad_events) > 50000:
+            _bad_events.clear()
+
+
+def _bad_distinct_count(ip: str) -> int:
+    """최근 시간 안에 이 접속 주소가 시도한 '서로 다른' 잘못된 코드의 개수.
+    (같은 잘못된 코드를 계속 반복해서 묻는 낡은 프로그램은 1개로만 센다.
+     코드를 이것저것 바꿔 가며 맞혀 보는 대입 공격만 걸러내기 위함)"""
+    now = time.time()
+    with _rate_lock:
+        lst = [(t, i) for (t, i) in _bad_events.get(ip, []) if now - t < BAD_CODE_WINDOW_SECONDS]
+        if lst:
+            _bad_events[ip] = lst
+        else:
+            _bad_events.pop(ip, None)
+        return len({i for (_, i) in lst})
+
+
 def check_not_blocked(request: Request):
-    """없는 코드를 너무 많이 시도한 접속 주소는 잠시 막는다."""
-    if rate_limited("badcode", client_ip(request), BAD_CODE_LIMIT, BAD_CODE_WINDOW_SECONDS):
+    """서로 다른 잘못된 코드를 너무 많이 시도한 접속 주소는 잠시 막는다."""
+    if _bad_distinct_count(client_ip(request)) >= BAD_CODE_LIMIT:
         raise HTTPException(
             status_code=429,
             detail="잘못된 코드를 너무 많이 입력했습니다. 10분 뒤에 다시 시도해주세요.",
@@ -267,7 +291,7 @@ def ensure_printer_exists(con, code: str, request: Request = None):
     row = con.execute("SELECT * FROM printers WHERE code = ?", (code,)).fetchone()
     if not row:
         if request is not None:
-            _rate_add("badcode", client_ip(request))
+            _bad_add(client_ip(request), code)
         raise HTTPException(status_code=404, detail="등록되지 않은 코드입니다. 코드를 다시 확인해주세요.")
     return row
 
@@ -303,7 +327,7 @@ def authenticate_printer(con, row, request: Request):
         return
 
     if not token or not hmac.compare_digest(_hash_token(token), stored):
-        _rate_add("badcode", client_ip(request))
+        _bad_add(client_ip(request), row["code"])
         raise HTTPException(status_code=401, detail="이 코드의 인증 정보가 맞지 않습니다.")
 
 
