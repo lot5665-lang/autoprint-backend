@@ -57,6 +57,7 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+from urllib.parse import unquote
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -165,6 +166,9 @@ def _init_db():
             con.execute("ALTER TABLE printers ADD COLUMN token_hash TEXT")
         if "last_job_at" not in pcols:
             con.execute("ALTER TABLE printers ADD COLUMN last_job_at TEXT")
+        # v1.6: 수신 PC가 쓰는 프린터 이름 (앱 화면에 보여 주기 위함)
+        if "printer_name" not in pcols:
+            con.execute("ALTER TABLE printers ADD COLUMN printer_name TEXT")
         con.commit()
 
 
@@ -500,7 +504,15 @@ def printer_status(code: str, request: Request):
     code = normalize_code(code)
     with _db() as con:
         row = ensure_printer_exists(con, code, request)
-    return {"code": row["code"], "registered_at": row["created_at"], "last_seen": row["last_seen"]}
+    seen = _parse_iso(row["last_seen"]) if row["last_seen"] else None
+    online = bool(seen) and (datetime.now(timezone.utc) - seen).total_seconds() < 180
+    return {
+        "code": row["code"],
+        "registered_at": row["created_at"],
+        "last_seen": row["last_seen"],
+        "online": online,
+        "printer_name": (row["printer_name"] or "") if "printer_name" in row.keys() else "",
+    }
 
 
 @app.post("/api/upload/{code}")
@@ -586,6 +598,16 @@ def poll_jobs(code: str, request: Request):
         now = datetime.now(timezone.utc)
         if seen is None or (now - seen).total_seconds() >= LAST_SEEN_WRITE_INTERVAL:
             con.execute("UPDATE printers SET last_seen = ? WHERE code = ?", (now.isoformat(), code))
+
+        # 수신 PC 가 보낸 프린터 이름을 저장한다 (한글 이름은 URL 인코딩되어 온다)
+        raw_name = request.headers.get("x-printer-name")
+        if raw_name:
+            try:
+                new_name = unquote(raw_name).strip()[:80]
+            except Exception:
+                new_name = ""
+            if new_name and new_name != (row["printer_name"] or ""):
+                con.execute("UPDATE printers SET printer_name = ? WHERE code = ?", (new_name, code))
 
         rows = con.execute(
             "SELECT id, filename, created_at FROM jobs WHERE code = ? AND status = 'pending' "
